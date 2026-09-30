@@ -86,8 +86,8 @@ jobs:
           --targets ${{ inputs.node_range || 'node24' }}-win-x64
 
       # Proof the artifact is a real, runnable Windows executable before it is
-      # offered for download. A packaged binary that cannot answer `--version`
-      # would fail identically on the user's machine.
+      # offered for download. A packaged binary that cannot answer the version
+      # flag would fail identically on the user's machine.
       - name: Smoke-test the executable
         shell: pwsh
         run: |
@@ -121,9 +121,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ github.ref_name }}'
+          $notes = "Standalone Windows x64 executable built from ${{ github.sha }}."
           gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "dsh.exe $tag" `
-              --notes "Standalone Windows x64 executable built from ${{ github.sha }}."
+            gh release create $tag --title "dsh.exe $tag" --notes $notes
           }
           gh release upload $tag 'release-assets/dsh.exe' --clobber

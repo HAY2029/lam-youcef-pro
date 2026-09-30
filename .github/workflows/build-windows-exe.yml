@@ -1,0 +1,129 @@
+name: Build Windows EXE
+
+# Build a standalone, single-file Windows `dsh.exe` from this fork and publish it
+# as a downloadable release asset. This is the fork-local counterpart of the
+# upstream `build-exe-for-python-sdk.yml` lane: upstream retains a wheel for the
+# Python SDK, this lane retains the bare executable a Windows user can run.
+#
+# The build itself is `scripts/build-exe-for-python-sdk.ts` with the `node24-win-x64`
+# target. That script stages a symlink-free dependency closure and packages it with
+# `@yao-pkg/pkg --sea`; the resulting binary is a real native executable, not a wrapper.
+on:
+  workflow_dispatch:
+    inputs:
+      node_range:
+        description: pkg Node major range to package against.
+        type: string
+        required: false
+        default: node24
+  push:
+    tags:
+      - 'exe-v*'
+
+concurrency:
+  group: build-windows-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: node24-win-x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-js-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # The staging step creates directory junctions/symlinks; Windows requires
+      # Developer Mode (or elevation) for those to succeed on a hosted runner.
+      - name: Enable Windows Developer Mode (symlink support)
+        shell: pwsh
+        run: >-
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+          /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.10'
+
+      # pkg downloads its target Node binary on first use; caching keeps repeat
+      # runs from re-fetching it.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.pkg-cache
+          key: pkg-fetch-node24-win-x64-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pkg-fetch-node24-win-x64-
+
+      - name: Install (immutable)
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if pnpm install --frozen-lockfile; then exit 0; fi
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
+          exit 1
+
+      - name: Build single-exe
+        shell: pwsh
+        run: >-
+          pnpm exec tsx scripts/build-exe-for-python-sdk.ts
+          --targets ${{ inputs.node_range || 'node24' }}-win-x64
+
+      # Proof the artifact is a real, runnable Windows executable before it is
+      # offered for download. A packaged binary that cannot answer `--version`
+      # would fail identically on the user's machine.
+      - name: Smoke-test the executable
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path dist-exe -Filter '*-win-x64.exe' -Recurse |
+            Select-Object -First 1
+          if (-not $exe) { throw 'No win-x64 executable produced in dist-exe' }
+          Write-Host "Smoke-testing $($exe.FullName)"
+          & $exe.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "dsh.exe --version exited with $LASTEXITCODE" }
+          $exe.FullName | Out-File -FilePath exe-path.txt -Encoding ascii
+
+      - name: Rename artifact
+        shell: pwsh
+        run: |
+          $exe = (Get-Content exe-path.txt -Raw).Trim()
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item $exe 'release-assets/dsh.exe' -Force
+          Get-Item 'release-assets/dsh.exe' | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dsh-win-x64-exe
+          path: release-assets/dsh.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/exe-v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "dsh.exe $tag" `
+              --notes "Standalone Windows x64 executable built from ${{ github.sha }}."
+          }
+          gh release upload $tag 'release-assets/dsh.exe' --clobber
